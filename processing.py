@@ -272,9 +272,15 @@ def render_hand_video(
     track_size = (max(1, int(roi_width * tracking_scale)), max(1, int(roi_height * tracking_scale)))
     sprite, tip_x, tip_y = _prepare_sprite(hand_rgba, width, config)
 
+    # Important: the hand must never depend on successful tracking just to exist.
+    # Before tracking locks onto a stroke, show it at a safe in-frame position.
+    fallback_anchor = (
+        left + roi_width * 0.25,
+        top + roi_height * 0.35,
+    )
+
     previous_gray: np.ndarray | None = None
     tracked: tuple[float, float] | None = None
-    idle_frames = config.hide_after_frames + 1
     written = 0
     active_count = 0
 
@@ -317,14 +323,12 @@ def render_hand_video(
                         tracked[0] * (1.0 - a) + candidate[0] * a,
                         tracked[1] * (1.0 - a) + candidate[1] * a,
                     )
-                idle_frames = 0
                 active_count += 1
-            else:
-                idle_frames += 1
 
-            if tracked is not None and idle_frames <= config.hide_after_frames:
-                fade = 1.0 - idle_frames / max(1, config.hide_after_frames + 1)
-                _overlay_rgba(frame, sprite, tracked, (tip_x, tip_y), config.hand_opacity * fade)
+            # Always draw the hand. If tracking has not found a stroke yet,
+            # it stays at the fallback anchor. Once tracking works, it follows.
+            display_anchor = tracked if tracked is not None else fallback_anchor
+            _overlay_rgba(frame, sprite, display_anchor, (tip_x, tip_y), config.hand_opacity)
 
             writer.write(frame)
             written += 1
