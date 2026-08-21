@@ -67,15 +67,15 @@ if video is not None:
     custom_hand = st.file_uploader(
         "Optional transparent hand PNG",
         type=["png"],
-        help="Leave empty to use the built-in test hand. We can replace it with your final illustrated hand later.",
+        help="Leave empty to use the built-in illustrated hand, or upload your own transparent PNG to override it.",
     )
     hand_a, hand_b, hand_c = st.columns(3)
     with hand_a:
         hand_side = st.selectbox("Hand enters from", ["Right", "Left"])
         hand_size = st.slider("Hand size (% of video width)", 12, 65, 34)
     with hand_b:
-        tip_x = st.slider("Pencil tip X inside hand (%)", 0, 100, 8)
-        tip_y = st.slider("Pencil tip Y inside hand (%)", 0, 100, 13)
+        tip_x = st.slider("Pencil tip X inside hand (%)", 0, 100, 15)
+        tip_y = st.slider("Pencil tip Y inside hand (%)", 0, 100, 34)
     with hand_c:
         opacity = st.slider("Hand opacity", 0.20, 1.00, 0.96, 0.02)
         smoothing = st.slider("Movement smoothing", 0.05, 1.00, 0.42, 0.01)
