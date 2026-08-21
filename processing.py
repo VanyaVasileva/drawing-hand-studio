@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Callable
 
@@ -12,17 +13,18 @@ from PIL import Image
 
 
 ProgressCallback = Callable[[float, str], None]
+DEFAULT_HAND_PATH = Path(__file__).parent / "assets" / "default_hand.png"
 
 
 @dataclass(frozen=True)
 class RenderConfig:
-    sensitivity: int = 24
-    minimum_change_area: int = 18
+    sensitivity: int = 12
+    minimum_change_area: int = 6
     smoothing: float = 0.42
-    hide_after_frames: int = 5
+    hide_after_frames: int = 18
     maximum_jump: int = 220
     hand_width_percent: float = 34.0
-    hand_opacity: float = 0.96
+    hand_opacity: float = 1.0
     hand_side: str = "Right"
     tip_x_percent: float = 14.8
     tip_y_percent: float = 34.4
@@ -30,6 +32,7 @@ class RenderConfig:
     roi_top_percent: float = 0.0
     roi_right_percent: float = 100.0
     roi_bottom_percent: float = 100.0
+    audio_gain: float = 96.0
 
 
 @dataclass(frozen=True)
@@ -42,33 +45,60 @@ class RenderResult:
     audio_preserved: bool
 
 
-DEFAULT_HAND_PATH = Path(__file__).parent / "assets" / "default_hand.png"
-
-
 def load_default_hand() -> np.ndarray:
-    """Load the bundled illustrated hand-and-stylus sprite as transparent RGBA.
+    """Load the exact bundled transparent hand illustration as RGBA."""
+    with Image.open(DEFAULT_HAND_PATH) as image:
+        return np.asarray(image.convert("RGBA"))
 
-    Pencil tip sits at roughly (14.8%, 34.4%) of the sprite's width/height,
-    matching RenderConfig.tip_x_percent / tip_y_percent defaults.
-    """
-    image = Image.open(DEFAULT_HAND_PATH).convert("RGBA")
-    return np.asarray(image)
+
+def make_default_hand(width: int | None = None) -> np.ndarray:
+    """Compatibility helper used by the test suite."""
+    hand = load_default_hand()
+    if width is None or width <= 0 or hand.shape[1] == width:
+        return hand
+    target_height = max(1, round(hand.shape[0] * width / hand.shape[1]))
+    return _resize_rgba_premultiplied(hand, width, target_height)
 
 
 def load_hand_image(data: bytes | None) -> np.ndarray:
     if not data:
         return load_default_hand()
-    from io import BytesIO
+    with Image.open(BytesIO(data)) as image:
+        return np.asarray(image.convert("RGBA"))
 
-    image = Image.open(BytesIO(data)).convert("RGBA")
-    return np.asarray(image)
+
+def _resize_rgba_premultiplied(sprite: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize RGBA without creating light/dark halos around transparent edges."""
+    rgba = sprite.astype(np.float32)
+    alpha = rgba[:, :, 3:4] / 255.0
+    premultiplied = rgba[:, :, :3] * alpha
+    scale = width / max(1, sprite.shape[1])
+    interpolation = cv2.INTER_AREA if scale <= 1.0 else cv2.INTER_CUBIC
+
+    resized_alpha = cv2.resize(alpha, (width, height), interpolation=interpolation)
+    if resized_alpha.ndim == 2:
+        resized_alpha = resized_alpha[:, :, None]
+    resized_rgb = cv2.resize(premultiplied, (width, height), interpolation=interpolation)
+
+    unpremultiplied = np.zeros_like(resized_rgb)
+    np.divide(
+        resized_rgb,
+        resized_alpha,
+        out=unpremultiplied,
+        where=resized_alpha > 1e-6,
+    )
+    result = np.concatenate(
+        [np.clip(unpremultiplied, 0, 255), np.clip(resized_alpha * 255.0, 0, 255)],
+        axis=2,
+    )
+    return result.astype(np.uint8)
 
 
 def _prepare_sprite(sprite: np.ndarray, frame_width: int, config: RenderConfig) -> tuple[np.ndarray, int, int]:
     target_width = max(60, int(frame_width * config.hand_width_percent / 100.0))
     ratio = target_width / sprite.shape[1]
     target_height = max(1, int(sprite.shape[0] * ratio))
-    resized = cv2.resize(sprite, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    resized = _resize_rgba_premultiplied(sprite, target_width, target_height)
 
     tip_x = int(target_width * config.tip_x_percent / 100.0)
     tip_y = int(target_height * config.tip_y_percent / 100.0)
@@ -122,31 +152,78 @@ def _candidate_from_change(mask: np.ndarray, previous: tuple[float, float] | Non
         points = points[nearby]
         distances = distances[nearby]
 
-    # The newest brush tip is usually at the leading edge of the changed pixels.
     cutoff = np.percentile(distances, 88)
     leading = points[distances >= cutoff]
     return float(np.median(leading[:, 0])), float(np.median(leading[:, 1]))
 
 
-def _mux_original_audio(silent_video: Path, original_video: Path, output_video: Path) -> bool:
+def _candidate_from_frames(
+    gray: np.ndarray,
+    previous_gray: np.ndarray,
+    previous_local: tuple[float, float] | None,
+    config: RenderConfig,
+    tracking_scale: float,
+) -> tuple[float, float] | None:
+    difference = cv2.absdiff(gray, previous_gray)
+    attempts = (
+        (config.sensitivity, config.minimum_change_area),
+        (max(3, config.sensitivity // 3), max(2, config.minimum_change_area // 3)),
+    )
+
+    for threshold, minimum_area in attempts:
+        _, mask = cv2.threshold(difference, threshold, 255, cv2.THRESH_BINARY)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+        if int(cv2.countNonZero(mask)) < minimum_area:
+            continue
+        candidate = _candidate_from_change(mask, previous_local, config.maximum_jump * tracking_scale)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _source_has_audio(ffmpeg: str, original_video: Path) -> bool:
+    probe = subprocess.run(
+        [ffmpeg, "-i", str(original_video)], capture_output=True, check=False, text=True
+    )
+    return "Audio:" in probe.stderr
+
+
+def _mux_original_audio(
+    silent_video: Path,
+    original_video: Path,
+    output_video: Path,
+    audio_gain: float,
+) -> bool:
     ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
+    if not ffmpeg or not _source_has_audio(ffmpeg, original_video):
         shutil.move(str(silent_video), str(output_video))
         return False
 
     command = [
-        ffmpeg, "-y", "-loglevel", "error",
-        "-i", str(silent_video), "-i", str(original_video),
-        "-map", "0:v:0", "-map", "1:a?",
-        "-c:v", "copy", "-c:a", "aac", "-shortest", str(output_video),
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(silent_video),
+        "-i",
+        str(original_video),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
     ]
+    if abs(audio_gain - 1.0) > 1e-9:
+        command += ["-filter:a", f"volume={audio_gain:g}"]
+    command += ["-c:a", "aac", "-b:a", "256k", "-shortest", str(output_video)]
+
     completed = subprocess.run(command, capture_output=True, check=False)
     if completed.returncode == 0 and output_video.exists() and output_video.stat().st_size:
         silent_video.unlink(missing_ok=True)
-        probe = subprocess.run(
-            [ffmpeg, "-i", str(original_video)], capture_output=True, check=False, text=True
-        )
-        return "Audio:" in probe.stderr
+        return True
 
     shutil.move(str(silent_video), str(output_video))
     return False
@@ -213,20 +290,22 @@ def render_hand_video(
             gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
             candidate = None
-            changed_area = 0
             if previous_gray is not None:
-                difference = cv2.absdiff(gray, previous_gray)
-                _, mask = cv2.threshold(difference, config.sensitivity, 255, cv2.THRESH_BINARY)
-                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-                mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
-                changed_area = int(cv2.countNonZero(mask))
                 previous_local = None
                 if tracked is not None:
-                    previous_local = ((tracked[0] - left) * tracking_scale, (tracked[1] - top) * tracking_scale)
-                if changed_area >= config.minimum_change_area:
-                    local = _candidate_from_change(mask, previous_local, config.maximum_jump * tracking_scale)
-                    if local is not None:
-                        candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
+                    previous_local = (
+                        (tracked[0] - left) * tracking_scale,
+                        (tracked[1] - top) * tracking_scale,
+                    )
+                local = _candidate_from_frames(
+                    gray,
+                    previous_gray,
+                    previous_local,
+                    config,
+                    tracking_scale,
+                )
+                if local is not None:
+                    candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
 
             previous_gray = gray
             if candidate is not None:
@@ -234,7 +313,10 @@ def render_hand_video(
                     tracked = candidate
                 else:
                     a = float(np.clip(config.smoothing, 0.05, 1.0))
-                    tracked = (tracked[0] * (1.0 - a) + candidate[0] * a, tracked[1] * (1.0 - a) + candidate[1] * a)
+                    tracked = (
+                        tracked[0] * (1.0 - a) + candidate[0] * a,
+                        tracked[1] * (1.0 - a) + candidate[1] * a,
+                    )
                 idle_frames = 0
                 active_count += 1
             else:
@@ -259,7 +341,7 @@ def render_hand_video(
 
     if progress:
         progress(.98, "Restoring the original audio")
-    audio_preserved = _mux_original_audio(silent_path, input_path, output_path)
+    audio_preserved = _mux_original_audio(silent_path, input_path, output_path, config.audio_gain)
     if progress:
         progress(1.0, "Finished")
 
