@@ -12,13 +12,13 @@ from processing import RenderConfig, load_hand_image, render_hand_video
 st.set_page_config(page_title="Drawing Hand Studio", page_icon="✍️", layout="wide")
 
 st.title("Drawing Hand Studio")
-st.caption("Add a natural hand-and-stylus overlay to any drawing screen recording.")
+st.caption("Add the clean transparent hand to a drawing screen recording.")
 
-with st.expander("How this first prototype works", expanded=False):
+with st.expander("How the tracking works", expanded=False):
     st.write(
-        "The tracker looks for newly changing pixels inside the drawing area and places the stylus tip "
-        "at the leading edge. It works best when the canvas stays still. Zooming, rotating, opening menus, "
-        "undoing, or moving large areas can confuse this first experimental tracker."
+        "The tracker looks for newly changing pixels inside the drawing area and places the pencil tip "
+        "at the leading edge. It now uses a more forgiving fallback pass so the hand is less likely to disappear "
+        "when a stroke produces only small pixel changes."
     )
 
 video = st.file_uploader("Upload a drawing screen recording", type=["mp4", "mov", "m4v"])
@@ -51,10 +51,10 @@ if video is not None:
         st.metric("Video size", f"{width} × {height}")
         st.metric("Duration", f"{duration:.1f} seconds")
         if duration > 90:
-            st.warning("For the first hosted version, test with a clip under 90 seconds.")
+            st.warning("For the hosted version, test with a clip under 90 seconds.")
 
     st.subheader("1. Drawing area")
-    st.caption("Exclude Procreate or app menus when possible. Start with the full frame for a simple recording.")
+    st.caption("Exclude app menus when possible. Start with the full frame for a simple recording.")
     area_a, area_b = st.columns(2)
     with area_a:
         left = st.slider("Left edge (%)", 0, 80, 0)
@@ -67,27 +67,52 @@ if video is not None:
     custom_hand = st.file_uploader(
         "Optional transparent hand PNG",
         type=["png"],
-        help="Leave empty to use the built-in illustrated hand, or upload your own transparent PNG to override it.",
+        help="Leave empty to use the exact clean hand already bundled in the app.",
     )
-    hand_a, hand_b, hand_c = st.columns(3)
-    with hand_a:
-        hand_side = st.selectbox("Hand enters from", ["Right", "Left"])
-        hand_size = st.slider("Hand size (% of video width)", 12, 65, 34)
-    with hand_b:
-        tip_x = st.slider("Pencil tip X inside hand (%)", 0, 100, 15)
-        tip_y = st.slider("Pencil tip Y inside hand (%)", 0, 100, 34)
-    with hand_c:
-        opacity = st.slider("Hand opacity", 0.20, 1.00, 0.96, 0.02)
-        smoothing = st.slider("Movement smoothing", 0.05, 1.00, 0.42, 0.01)
+
+    try:
+        hand_preview = load_hand_image(custom_hand.getvalue() if custom_hand else None)
+    except Exception as exc:
+        st.error(f"The hand PNG could not be loaded: {exc}")
+        st.stop()
+
+    hand_preview_col, hand_controls_col = st.columns([1, 1.4])
+    with hand_preview_col:
+        st.image(
+            hand_preview,
+            caption="Hand loaded — this is the sprite that will be used",
+            width=320,
+        )
+        if custom_hand:
+            st.success("Uploaded hand accepted.")
+        else:
+            st.info("Using the built-in clean transparent hand.")
+        if hand_preview.ndim == 3 and hand_preview.shape[2] == 4:
+            alpha = hand_preview[:, :, 3]
+            if int(alpha.min()) == 255:
+                st.warning("This PNG has no transparent pixels. Use a transparent-background PNG for clean edges.")
+
+    with hand_controls_col:
+        hand_a, hand_b = st.columns(2)
+        with hand_a:
+            hand_side = st.selectbox("Hand enters from", ["Right", "Left"])
+            hand_size = st.slider("Hand size (% of video width)", 12, 65, 34)
+            opacity = st.slider("Hand opacity", 0.20, 1.00, 1.00, 0.02)
+        with hand_b:
+            tip_x = st.slider("Pencil tip X inside hand (%)", 0, 100, 15)
+            tip_y = st.slider("Pencil tip Y inside hand (%)", 0, 100, 34)
+            smoothing = st.slider("Movement smoothing", 0.05, 1.00, 0.42, 0.01)
 
     st.subheader("3. Tracking")
     track_a, track_b, track_c = st.columns(3)
     with track_a:
-        sensitivity = st.slider("Pixel-change sensitivity", 5, 80, 24)
+        sensitivity = st.slider("Pixel-change sensitivity", 3, 80, 12)
     with track_b:
-        minimum_area = st.slider("Minimum changed area", 4, 150, 18)
+        minimum_area = st.slider("Minimum changed area", 2, 150, 6)
     with track_c:
-        hide_after = st.slider("Lift hand after frames", 1, 30, 5)
+        hide_after = st.slider("Lift hand after frames", 1, 60, 18)
+
+    st.caption("Audio: 96× volume only. No denoise, cleaner, EQ, compression, or other audio processing is applied.")
 
     if left >= right or top >= bottom:
         st.error("The drawing area edges overlap. Please widen the selected area.")
@@ -109,8 +134,8 @@ if video is not None:
             roi_top_percent=top,
             roi_right_percent=right,
             roi_bottom_percent=bottom,
+            audio_gain=96.0,
         )
-        hand = load_hand_image(custom_hand.getvalue() if custom_hand else None)
         progress_bar = st.progress(0.0, text="Starting")
 
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as result_file:
@@ -120,7 +145,7 @@ if video is not None:
             result = render_hand_video(
                 source_path,
                 result_path,
-                hand,
+                hand_preview,
                 config,
                 progress=lambda value, label: progress_bar.progress(value, text=label),
             )
@@ -139,9 +164,17 @@ if video is not None:
         st.subheader("Result")
         st.video(st.session_state["rendered_video"])
         if stats:
+            if stats.tracked_frames == 0:
+                st.error(
+                    "No drawing movement was detected, so the hand had no tracked position to follow. "
+                    "Lower Pixel-change sensitivity and Minimum changed area, then render again."
+                )
+            else:
+                st.success(f"Hand tracking detected movement in {stats.tracked_frames:,} frames.")
             st.caption(
-                f"Tracked movement in {stats.tracked_frames:,} of {stats.frames:,} frames. "
-                + ("Original audio was preserved." if stats.audio_preserved else "No original audio track was found or FFmpeg was unavailable.")
+                "96× volume applied to the original audio with no cleaning/filtering."
+                if stats.audio_preserved
+                else "No original audio track was found or FFmpeg was unavailable, so no audio boost was applied."
             )
         st.download_button(
             "Download MP4",
@@ -151,7 +184,7 @@ if video is not None:
             use_container_width=True,
         )
 else:
-    st.info("Upload a short screen recording to begin. A 10–30 second test clip is ideal for the first validation.")
+    st.info("Upload a short drawing screen recording to begin.")
 
 st.divider()
-st.caption("Experimental MVP — automatic tracking must be validated with real drawing recordings before production use.")
+st.caption("Clean transparent hand • more forgiving tracking • 96× raw volume")
