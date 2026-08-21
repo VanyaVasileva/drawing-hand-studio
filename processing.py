@@ -19,10 +19,10 @@ class RenderConfig:
     sensitivity: int = 24
     minimum_change_area: int = 18
     smoothing: float = 0.42
-    hide_after_frames: int = 5
+    hide_after_frames: int = 12
     maximum_jump: int = 220
     hand_width_percent: float = 34.0
-    hand_opacity: float = 0.96
+    hand_opacity: float = 0.94
     hand_side: str = "Right"
     tip_x_percent: float = 14.8
     tip_y_percent: float = 34.4
@@ -131,56 +131,81 @@ def _candidate_from_change(mask: np.ndarray, previous: tuple[float, float] | Non
         points = points[nearby]
         distances = distances[nearby]
 
-    # The newest brush tip is usually at the leading edge of the changed pixels.
     cutoff = np.percentile(distances, 88)
     leading = points[distances >= cutoff]
     return float(np.median(leading[:, 0])), float(np.median(leading[:, 1]))
 
 
 def _tracking_frame(small_bgr: np.ndarray) -> np.ndarray:
-    """Build a texture-resistant, color-aware representation for tracking.
-
-    The first three channels preserve fine LAB color changes. The last three use
-    a stronger blur before LAB conversion, which averages away paper texture and
-    video-compression shimmer while retaining a real brush/paint change.
-    """
-    fine = cv2.GaussianBlur(small_bgr, (3, 3), 0)
-    coarse = cv2.GaussianBlur(small_bgr, (0, 0), 2.2)
-    fine_lab = cv2.cvtColor(fine, cv2.COLOR_BGR2LAB)
-    coarse_lab = cv2.cvtColor(coarse, cv2.COLOR_BGR2LAB)
-    return np.concatenate((fine_lab, coarse_lab), axis=2)
+    """Build a low-noise LAB frame for subtle paint changes on textured paper."""
+    softened = cv2.GaussianBlur(small_bgr, (5, 5), 0)
+    return cv2.cvtColor(softened, cv2.COLOR_BGR2LAB)
 
 
 def _change_mask(current: np.ndarray, previous: np.ndarray, config: RenderConfig) -> np.ndarray:
-    """Detect real drawing changes without assuming a white, flat canvas.
+    """Find newly changed pixels, including low-contrast paint on beige paper."""
+    difference = cv2.absdiff(current, previous)
+    difference_map = np.max(difference, axis=2).astype(np.uint8)
 
-    Fine-scale color catches pencil/edge detail. Coarse-scale color suppresses
-    textured-paper shimmer. Thresholds adapt to the noise in each frame pair,
-    so a beige textured canvas can use a lower threshold than the old fixed
-    grayscale-style detector without turning compression noise into movement.
-    """
-    fine_difference = cv2.absdiff(current[:, :, :3], previous[:, :, :3])
-    coarse_difference = cv2.absdiff(current[:, :, 3:], previous[:, :, 3:])
-    fine_map = np.max(fine_difference, axis=2).astype(np.uint8)
-    coarse_map = np.max(coarse_difference, axis=2).astype(np.uint8)
+    # The previous threshold was too high for pale paint on beige paper. Scale
+    # the user sensitivity into a low LAB-delta range, then raise it only when
+    # the current frame pair contains real background/compression noise.
+    base_threshold = max(2, int(round(config.sensitivity / 10.0)))
+    p90 = float(np.percentile(difference_map, 90.0))
+    p95 = float(np.percentile(difference_map, 95.0))
+    noise_threshold = int(np.ceil(max(p90 + 1.0, p95)))
+    threshold = max(base_threshold, noise_threshold)
 
-    sample = coarse_map.reshape(-1).astype(np.float32)
-    median = float(np.median(sample))
-    mad = float(np.median(np.abs(sample - median)))
-    noise_ceiling = median + 4.5 * 1.4826 * mad
+    _, mask = cv2.threshold(difference_map, threshold, 255, cv2.THRESH_BINARY)
 
-    user_floor = max(3, int(round(config.sensitivity * 0.25)))
-    coarse_threshold = max(user_floor, int(np.ceil(noise_ceiling + 2.0)))
-    fine_threshold = max(user_floor + 2, int(np.ceil(noise_ceiling + 4.0)))
-
-    _, coarse_mask = cv2.threshold(coarse_map, coarse_threshold, 255, cv2.THRESH_BINARY)
-    _, fine_mask = cv2.threshold(fine_map, fine_threshold, 255, cv2.THRESH_BINARY)
-
-    fine_mask = cv2.morphologyEx(fine_mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    mask = cv2.bitwise_or(coarse_mask, fine_mask)
+    # Do not use MORPH_OPEN: that can erase thin or faint pencil/paint changes.
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
     return mask
+
+
+def _open_video_writer(path: Path, fps: float, width: int, height: int):
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        command = [
+            ffmpeg, "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", f"{fps:.6f}",
+            "-i", "-", "-an",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "13",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(path),
+        ]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        return ("ffmpeg", process)
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError("The output video encoder could not be started.")
+    return ("opencv", writer)
+
+
+def _write_video_frame(writer_state, frame: np.ndarray) -> None:
+    kind, writer = writer_state
+    if kind == "ffmpeg":
+        if writer.stdin is None:
+            raise RuntimeError("The H.264 encoder input closed unexpectedly.")
+        writer.stdin.write(frame.tobytes())
+    else:
+        writer.write(frame)
+
+
+def _close_video_writer(writer_state) -> None:
+    kind, writer = writer_state
+    if kind == "ffmpeg":
+        if writer.stdin is not None:
+            writer.stdin.close()
+        stderr = writer.stderr.read().decode("utf-8", errors="replace") if writer.stderr else ""
+        code = writer.wait()
+        if code != 0:
+            raise RuntimeError(f"The H.264 encoder failed: {stderr[-500:]}")
+    else:
+        writer.release()
 
 
 def _mux_original_audio(silent_video: Path, original_video: Path, output_video: Path) -> bool:
@@ -230,10 +255,7 @@ def render_hand_video(
         capture.release()
         raise ValueError("The uploaded video has an invalid frame size.")
 
-    writer = cv2.VideoWriter(str(silent_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
-        capture.release()
-        raise RuntimeError("The output video encoder could not be started.")
+    writer_state = _open_video_writer(silent_path, fps, width, height)
 
     left = int(width * config.roi_left_percent / 100.0)
     right = int(width * config.roi_right_percent / 100.0)
@@ -241,7 +263,7 @@ def render_hand_video(
     bottom = int(height * config.roi_bottom_percent / 100.0)
     if right - left < 20 or bottom - top < 20:
         capture.release()
-        writer.release()
+        _close_video_writer(writer_state)
         raise ValueError("The selected drawing area is too small.")
 
     roi_width = right - left
@@ -253,6 +275,8 @@ def render_hand_video(
     previous_tracking: np.ndarray | None = None
     tracked: tuple[float, float] | None = None
     idle_frames = config.hide_after_frames + 1
+    hold_frames = max(config.hide_after_frames, int(round(fps * 0.35)))
+    max_change_pixels = int(track_size[0] * track_size[1] * 0.08)
     written = 0
     active_count = 0
 
@@ -274,7 +298,7 @@ def render_hand_video(
                 previous_local = None
                 if tracked is not None:
                     previous_local = ((tracked[0] - left) * tracking_scale, (tracked[1] - top) * tracking_scale)
-                if changed_area >= config.minimum_change_area:
+                if config.minimum_change_area <= changed_area <= max_change_pixels:
                     local = _candidate_from_change(mask, previous_local, config.maximum_jump * tracking_scale)
                     if local is not None:
                         candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
@@ -291,18 +315,19 @@ def render_hand_video(
             else:
                 idle_frames += 1
 
-            if tracked is not None and idle_frames <= config.hide_after_frames:
-                fade = 1.0 - idle_frames / max(1, config.hide_after_frames + 1)
-                _overlay_rgba(frame, sprite, tracked, (tip_x, tip_y), config.hand_opacity * fade)
+            if tracked is not None and idle_frames <= hold_frames:
+                # Keep the hand at a fixed opacity. The previous fade could make
+                # it look blurry/washed out during short tracking gaps.
+                _overlay_rgba(frame, sprite, tracked, (tip_x, tip_y), config.hand_opacity)
 
-            writer.write(frame)
+            _write_video_frame(writer_state, frame)
             written += 1
             if progress and (written == 1 or written % max(1, int(fps / 2)) == 0):
                 fraction = written / frame_count if frame_count > 0 else 0.0
                 progress(min(.97, fraction), f"Processing frame {written:,}")
     finally:
         capture.release()
-        writer.release()
+        _close_video_writer(writer_state)
 
     if written == 0:
         silent_path.unlink(missing_ok=True)
