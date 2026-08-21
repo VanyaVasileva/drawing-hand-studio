@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -46,17 +47,11 @@ DEFAULT_HAND_PATH = Path(__file__).parent / "assets" / "default_hand.png"
 
 
 def load_default_hand() -> np.ndarray:
-    """Load the bundled illustrated hand-and-stylus sprite as transparent RGBA.
-
-    Pencil tip sits at roughly (14.8%, 34.4%) of the sprite's width/height,
-    matching RenderConfig.tip_x_percent / tip_y_percent defaults.
-    """
     image = Image.open(DEFAULT_HAND_PATH).convert("RGBA")
     return np.asarray(image)
 
 
 def make_default_hand(width: int | None = None) -> np.ndarray:
-    """Load the bundled hand, optionally resized for tests/preview helpers."""
     hand = load_default_hand()
     if width is None or width <= 0 or hand.shape[1] == width:
         return hand
@@ -78,7 +73,6 @@ def _prepare_sprite(sprite: np.ndarray, frame_width: int, config: RenderConfig) 
     ratio = target_width / sprite.shape[1]
     target_height = max(1, int(sprite.shape[0] * ratio))
     resized = cv2.resize(sprite, (target_width, target_height), interpolation=cv2.INTER_AREA)
-
     tip_x = int(target_width * config.tip_x_percent / 100.0)
     tip_y = int(target_height * config.tip_y_percent / 100.0)
     if config.hand_side.lower() == "left":
@@ -92,12 +86,10 @@ def _overlay_rgba(frame: np.ndarray, sprite: np.ndarray, anchor: tuple[float, fl
     y = int(anchor[1] - tip[1])
     sh, sw = sprite.shape[:2]
     fh, fw = frame.shape[:2]
-
     x1, y1 = max(0, x), max(0, y)
     x2, y2 = min(fw, x + sw), min(fh, y + sh)
     if x1 >= x2 or y1 >= y2:
         return
-
     sx1, sy1 = x1 - x, y1 - y
     sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
     crop = sprite[sy1:sy2, sx1:sx2]
@@ -112,7 +104,6 @@ def _candidate_from_change(mask: np.ndarray, previous: tuple[float, float] | Non
     if len(xs) == 0:
         return None
     points = np.column_stack((xs, ys)).astype(np.float32)
-
     if previous is None:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -123,45 +114,99 @@ def _candidate_from_change(mask: np.ndarray, previous: tuple[float, float] | Non
             return moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]
         x, y, w, h = cv2.boundingRect(contour)
         return x + w / 2.0, y + h / 2.0
-
     origin = np.asarray(previous, dtype=np.float32)
     distances = np.linalg.norm(points - origin, axis=1)
     nearby = distances <= maximum_jump
     if np.count_nonzero(nearby) >= 3:
         points = points[nearby]
         distances = distances[nearby]
-
     cutoff = np.percentile(distances, 88)
     leading = points[distances >= cutoff]
     return float(np.median(leading[:, 0])), float(np.median(leading[:, 1]))
 
 
 def _tracking_frame(small_bgr: np.ndarray) -> np.ndarray:
-    """Build a low-noise LAB frame for subtle paint changes on textured paper."""
-    softened = cv2.GaussianBlur(small_bgr, (5, 5), 0)
-    return cv2.cvtColor(softened, cv2.COLOR_BGR2LAB)
+    """Capture the actual paper texture once, instead of assuming white paper."""
+    softened = cv2.GaussianBlur(small_bgr, (3, 3), 0)
+    return cv2.cvtColor(softened, cv2.COLOR_BGR2LAB).astype(np.float32)
 
 
-def _change_mask(current: np.ndarray, previous: np.ndarray, config: RenderConfig) -> np.ndarray:
-    """Find newly changed pixels, including low-contrast paint on beige paper."""
-    difference = cv2.absdiff(current, previous)
-    difference_map = np.max(difference, axis=2).astype(np.uint8)
+def _background_delta(current: np.ndarray, baseline: np.ndarray) -> np.ndarray:
+    """Per-pixel perceptual change from the original canvas appearance."""
+    difference = np.abs(current - baseline)
+    return np.sqrt((difference[:, :, 0] * 0.60) ** 2 + difference[:, :, 1] ** 2 + difference[:, :, 2] ** 2)
 
-    # The previous threshold was too high for pale paint on beige paper. Scale
-    # the user sensitivity into a low LAB-delta range, then raise it only when
-    # the current frame pair contains real background/compression noise.
-    base_threshold = max(2, int(round(config.sensitivity / 10.0)))
-    p90 = float(np.percentile(difference_map, 90.0))
-    p95 = float(np.percentile(difference_map, 95.0))
-    noise_threshold = int(np.ceil(max(p90 + 1.0, p95)))
-    threshold = max(base_threshold, noise_threshold)
 
-    _, mask = cv2.threshold(difference_map, threshold, 255, cv2.THRESH_BINARY)
+def _new_ink_mask(current_delta: np.ndarray, old_delta: np.ndarray, config: RenderConfig) -> np.ndarray:
+    """Return only pixels that became more different from the captured canvas recently.
 
-    # Do not use MORPH_OPEN: that can erase thin or faint pencil/paint changes.
+    Because both maps are measured against the same initial canvas, the original
+    beige/white color and the paper texture cancel out. Looking several frames
+    back also accumulates very faint Procreate brush buildup that consecutive
+    frame differencing can miss.
+    """
+    novelty = np.maximum(current_delta - old_delta, 0.0)
+    novelty = cv2.GaussianBlur(novelty, (3, 3), 0)
+
+    threshold = max(1.15, float(config.sensitivity) / 16.0)
+    mask = (novelty >= threshold).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
     return mask
+
+
+def _is_large_ui_change(background_delta: np.ndarray) -> bool:
+    """Detect large rectangular overlays such as Procreate brush/settings panels."""
+    mask = (background_delta >= 3.0).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    frame_area = mask.shape[0] * mask.shape[1]
+    for index in range(1, count):
+        x, y, w, h, area = stats[index]
+        box_area = max(1, int(w) * int(h))
+        fill = float(area) / box_area
+        if area >= frame_area * 0.20 and fill >= 0.45:
+            return True
+    return False
+
+
+def _bbox_distance(x: int, y: int, w: int, h: int, point: tuple[float, float]) -> float:
+    px, py = point
+    dx = max(float(x) - px, 0.0, px - float(x + w - 1))
+    dy = max(float(y) - py, 0.0, py - float(y + h - 1))
+    return float(np.hypot(dx, dy))
+
+
+def _candidate_from_components(
+    mask: np.ndarray,
+    previous: tuple[float, float] | None,
+    maximum_jump: float,
+    minimum_area: int,
+) -> tuple[float, float] | None:
+    """Track coherent new-ink regions, not scattered paper/compression noise."""
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    frame_area = mask.shape[0] * mask.shape[1]
+    max_area = max(minimum_area * 4, int(frame_area * 0.045))
+    choices: list[tuple[float, int, int]] = []
+
+    for index in range(1, count):
+        x, y, w, h, area = [int(v) for v in stats[index]]
+        if area < minimum_area or area > max_area:
+            continue
+        if previous is None:
+            score = -float(area)
+        else:
+            distance = _bbox_distance(x, y, w, h, previous)
+            if distance > maximum_jump * 1.35:
+                continue
+            score = distance - min(area, 1200) * 0.012
+        choices.append((score, index, area))
+
+    if not choices:
+        return None
+    choices.sort(key=lambda item: item[0])
+    _, best_index, _ = choices[0]
+    component = np.where(labels == best_index, 255, 0).astype(np.uint8)
+    return _candidate_from_change(component, previous, maximum_jump)
 
 
 def _open_video_writer(path: Path, fps: float, width: int, height: int):
@@ -178,7 +223,6 @@ def _open_video_writer(path: Path, fps: float, width: int, height: int):
         ]
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         return ("ffmpeg", process)
-
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     if not writer.isOpened():
         raise RuntimeError("The output video encoder could not be started.")
@@ -213,7 +257,6 @@ def _mux_original_audio(silent_video: Path, original_video: Path, output_video: 
     if not ffmpeg:
         shutil.move(str(silent_video), str(output_video))
         return False
-
     command = [
         ffmpeg, "-y", "-loglevel", "error",
         "-i", str(silent_video), "-i", str(original_video),
@@ -223,11 +266,8 @@ def _mux_original_audio(silent_video: Path, original_video: Path, output_video: 
     completed = subprocess.run(command, capture_output=True, check=False)
     if completed.returncode == 0 and output_video.exists() and output_video.stat().st_size:
         silent_video.unlink(missing_ok=True)
-        probe = subprocess.run(
-            [ffmpeg, "-i", str(original_video)], capture_output=True, check=False, text=True
-        )
+        probe = subprocess.run([ffmpeg, "-i", str(original_video)], capture_output=True, check=False, text=True)
         return "Audio:" in probe.stderr
-
     shutil.move(str(silent_video), str(output_video))
     return False
 
@@ -272,11 +312,12 @@ def render_hand_video(
     track_size = (max(1, int(roi_width * tracking_scale)), max(1, int(roi_height * tracking_scale)))
     sprite, tip_x, tip_y = _prepare_sprite(hand_rgba, width, config)
 
-    previous_tracking: np.ndarray | None = None
+    baseline: np.ndarray | None = None
+    delta_history: deque[np.ndarray] = deque(maxlen=6)
     tracked: tuple[float, float] | None = None
     idle_frames = config.hide_after_frames + 1
     hold_frames = max(config.hide_after_frames, int(round(fps * 0.35)))
-    max_change_pixels = int(track_size[0] * track_size[1] * 0.08)
+    minimum_component_area = max(10, int(round(config.minimum_change_area * max(0.6, tracking_scale))))
     written = 0
     active_count = 0
 
@@ -289,35 +330,45 @@ def render_hand_video(
             roi = frame[top:bottom, left:right]
             small = cv2.resize(roi, track_size, interpolation=cv2.INTER_AREA)
             tracking = _tracking_frame(small)
+            if baseline is None:
+                baseline = tracking.copy()
 
+            background_delta = _background_delta(tracking, baseline)
             candidate = None
-            changed_area = 0
-            if previous_tracking is not None:
-                mask = _change_mask(tracking, previous_tracking, config)
-                changed_area = int(cv2.countNonZero(mask))
+            if len(delta_history) >= 4 and not _is_large_ui_change(background_delta):
+                old_delta = delta_history[-4]
+                mask = _new_ink_mask(background_delta, old_delta, config)
                 previous_local = None
                 if tracked is not None:
-                    previous_local = ((tracked[0] - left) * tracking_scale, (tracked[1] - top) * tracking_scale)
-                if config.minimum_change_area <= changed_area <= max_change_pixels:
-                    local = _candidate_from_change(mask, previous_local, config.maximum_jump * tracking_scale)
-                    if local is not None:
-                        candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
+                    previous_local = (
+                        (tracked[0] - left) * tracking_scale,
+                        (tracked[1] - top) * tracking_scale,
+                    )
+                local = _candidate_from_components(
+                    mask,
+                    previous_local,
+                    config.maximum_jump * tracking_scale,
+                    minimum_component_area,
+                )
+                if local is not None:
+                    candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
 
-            previous_tracking = tracking
+            delta_history.append(background_delta)
             if candidate is not None:
                 if tracked is None:
                     tracked = candidate
                 else:
                     a = float(np.clip(config.smoothing, 0.05, 1.0))
-                    tracked = (tracked[0] * (1.0 - a) + candidate[0] * a, tracked[1] * (1.0 - a) + candidate[1] * a)
+                    tracked = (
+                        tracked[0] * (1.0 - a) + candidate[0] * a,
+                        tracked[1] * (1.0 - a) + candidate[1] * a,
+                    )
                 idle_frames = 0
                 active_count += 1
             else:
                 idle_frames += 1
 
             if tracked is not None and idle_frames <= hold_frames:
-                # Keep the hand at a fixed opacity. The previous fade could make
-                # it look blurry/washed out during short tracking gaps.
                 _overlay_rgba(frame, sprite, tracked, (tip_x, tip_y), config.hand_opacity)
 
             _write_video_frame(writer_state, frame)
