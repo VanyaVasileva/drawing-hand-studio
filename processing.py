@@ -55,6 +55,15 @@ def load_default_hand() -> np.ndarray:
     return np.asarray(image)
 
 
+def make_default_hand(width: int | None = None) -> np.ndarray:
+    """Load the bundled hand, optionally resized for tests/preview helpers."""
+    hand = load_default_hand()
+    if width is None or width <= 0 or hand.shape[1] == width:
+        return hand
+    target_height = max(1, round(hand.shape[0] * width / hand.shape[1]))
+    return cv2.resize(hand, (width, target_height), interpolation=cv2.INTER_AREA)
+
+
 def load_hand_image(data: bytes | None) -> np.ndarray:
     if not data:
         return load_default_hand()
@@ -129,39 +138,48 @@ def _candidate_from_change(mask: np.ndarray, previous: tuple[float, float] | Non
 
 
 def _tracking_frame(small_bgr: np.ndarray) -> np.ndarray:
-    """Create a color-aware tracking frame.
+    """Build a texture-resistant, color-aware representation for tracking.
 
-    The old tracker converted everything to grayscale. Two colors can have very
-    similar grayscale brightness even when they are visibly different, which is
-    why some beige/off-white canvases could make drawing changes disappear.
-    LAB keeps lightness and color information, so tracking is much less dependent
-    on the paper/background color.
+    The first three channels preserve fine LAB color changes. The last three use
+    a stronger blur before LAB conversion, which averages away paper texture and
+    video-compression shimmer while retaining a real brush/paint change.
     """
-    blurred = cv2.GaussianBlur(small_bgr, (3, 3), 0)
-    return cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
+    fine = cv2.GaussianBlur(small_bgr, (3, 3), 0)
+    coarse = cv2.GaussianBlur(small_bgr, (0, 0), 2.2)
+    fine_lab = cv2.cvtColor(fine, cv2.COLOR_BGR2LAB)
+    coarse_lab = cv2.cvtColor(coarse, cv2.COLOR_BGR2LAB)
+    return np.concatenate((fine_lab, coarse_lab), axis=2)
 
 
 def _change_mask(current: np.ndarray, previous: np.ndarray, config: RenderConfig) -> np.ndarray:
-    """Detect per-pixel change using lightness OR color change.
+    """Detect real drawing changes without assuming a white, flat canvas.
 
-    A softer second pass only runs when the normal threshold finds too little.
-    That helps subtle strokes on darker/colored paper while keeping the original
-    sensitivity behavior for normal white backgrounds.
+    Fine-scale color catches pencil/edge detail. Coarse-scale color suppresses
+    textured-paper shimmer. Thresholds adapt to the noise in each frame pair,
+    so a beige textured canvas can use a lower threshold than the old fixed
+    grayscale-style detector without turning compression noise into movement.
     """
-    difference = cv2.absdiff(current, previous)
-    difference_map = np.max(difference, axis=2).astype(np.uint8)
+    fine_difference = cv2.absdiff(current[:, :, :3], previous[:, :, :3])
+    coarse_difference = cv2.absdiff(current[:, :, 3:], previous[:, :, 3:])
+    fine_map = np.max(fine_difference, axis=2).astype(np.uint8)
+    coarse_map = np.max(coarse_difference, axis=2).astype(np.uint8)
 
-    _, mask = cv2.threshold(difference_map, config.sensitivity, 255, cv2.THRESH_BINARY)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    sample = coarse_map.reshape(-1).astype(np.float32)
+    median = float(np.median(sample))
+    mad = float(np.median(np.abs(sample - median)))
+    noise_ceiling = median + 4.5 * 1.4826 * mad
 
-    if int(cv2.countNonZero(mask)) < config.minimum_change_area:
-        softer_threshold = max(6, int(round(config.sensitivity * 0.65)))
-        if softer_threshold < config.sensitivity:
-            _, mask = cv2.threshold(difference_map, softer_threshold, 255, cv2.THRESH_BINARY)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    user_floor = max(3, int(round(config.sensitivity * 0.25)))
+    coarse_threshold = max(user_floor, int(np.ceil(noise_ceiling + 2.0)))
+    fine_threshold = max(user_floor + 2, int(np.ceil(noise_ceiling + 4.0)))
 
+    _, coarse_mask = cv2.threshold(coarse_map, coarse_threshold, 255, cv2.THRESH_BINARY)
+    _, fine_mask = cv2.threshold(fine_map, fine_threshold, 255, cv2.THRESH_BINARY)
+
+    fine_mask = cv2.morphologyEx(fine_mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    mask = cv2.bitwise_or(coarse_mask, fine_mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
     return mask
 
 
