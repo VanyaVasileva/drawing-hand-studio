@@ -128,6 +128,43 @@ def _candidate_from_change(mask: np.ndarray, previous: tuple[float, float] | Non
     return float(np.median(leading[:, 0])), float(np.median(leading[:, 1]))
 
 
+def _tracking_frame(small_bgr: np.ndarray) -> np.ndarray:
+    """Create a color-aware tracking frame.
+
+    The old tracker converted everything to grayscale. Two colors can have very
+    similar grayscale brightness even when they are visibly different, which is
+    why some beige/off-white canvases could make drawing changes disappear.
+    LAB keeps lightness and color information, so tracking is much less dependent
+    on the paper/background color.
+    """
+    blurred = cv2.GaussianBlur(small_bgr, (3, 3), 0)
+    return cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
+
+
+def _change_mask(current: np.ndarray, previous: np.ndarray, config: RenderConfig) -> np.ndarray:
+    """Detect per-pixel change using lightness OR color change.
+
+    A softer second pass only runs when the normal threshold finds too little.
+    That helps subtle strokes on darker/colored paper while keeping the original
+    sensitivity behavior for normal white backgrounds.
+    """
+    difference = cv2.absdiff(current, previous)
+    difference_map = np.max(difference, axis=2).astype(np.uint8)
+
+    _, mask = cv2.threshold(difference_map, config.sensitivity, 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    if int(cv2.countNonZero(mask)) < config.minimum_change_area:
+        softer_threshold = max(6, int(round(config.sensitivity * 0.65)))
+        if softer_threshold < config.sensitivity:
+            _, mask = cv2.threshold(difference_map, softer_threshold, 255, cv2.THRESH_BINARY)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    return mask
+
+
 def _mux_original_audio(silent_video: Path, original_video: Path, output_video: Path) -> bool:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -195,7 +232,7 @@ def render_hand_video(
     track_size = (max(1, int(roi_width * tracking_scale)), max(1, int(roi_height * tracking_scale)))
     sprite, tip_x, tip_y = _prepare_sprite(hand_rgba, width, config)
 
-    previous_gray: np.ndarray | None = None
+    previous_tracking: np.ndarray | None = None
     tracked: tuple[float, float] | None = None
     idle_frames = config.hide_after_frames + 1
     written = 0
@@ -209,16 +246,12 @@ def render_hand_video(
 
             roi = frame[top:bottom, left:right]
             small = cv2.resize(roi, track_size, interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            tracking = _tracking_frame(small)
 
             candidate = None
             changed_area = 0
-            if previous_gray is not None:
-                difference = cv2.absdiff(gray, previous_gray)
-                _, mask = cv2.threshold(difference, config.sensitivity, 255, cv2.THRESH_BINARY)
-                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-                mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+            if previous_tracking is not None:
+                mask = _change_mask(tracking, previous_tracking, config)
                 changed_area = int(cv2.countNonZero(mask))
                 previous_local = None
                 if tracked is not None:
@@ -228,7 +261,7 @@ def render_hand_video(
                     if local is not None:
                         candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
 
-            previous_gray = gray
+            previous_tracking = tracking
             if candidate is not None:
                 if tracked is None:
                     tracked = candidate
