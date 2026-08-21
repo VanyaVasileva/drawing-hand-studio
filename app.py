@@ -16,9 +16,9 @@ st.caption("Add a natural hand-and-stylus overlay to any drawing screen recordin
 
 with st.expander("How this first prototype works", expanded=False):
     st.write(
-        "The tracker looks for newly changing pixels inside the drawing area and places the stylus tip "
-        "at the leading edge. It works best when the canvas stays still. Zooming, rotating, opening menus, "
-        "undoing, or moving large areas can confuse this first experimental tracker."
+        "The tracker follows newly added drawing changes inside the selected canvas area. "
+        "It uses the original canvas as a background reference so white, beige, and textured paper "
+        "can be tracked without changing the hand artwork."
     )
 
 video = st.file_uploader("Upload a drawing screen recording", type=["mp4", "mov", "m4v"])
@@ -72,7 +72,7 @@ if video is not None:
     hand_a, hand_b, hand_c = st.columns(3)
     with hand_a:
         hand_side = st.selectbox("Hand enters from", ["Right", "Left"])
-        hand_size = st.slider("Hand size (% of video width)", 12, 65, 34)
+        hand_size = st.slider("Hand size (% of video width)", 12, 80, 50)
     with hand_b:
         tip_x = st.slider("Pencil tip X inside hand (%)", 0, 100, 15)
         tip_y = st.slider("Pencil tip Y inside hand (%)", 0, 100, 34)
@@ -87,7 +87,7 @@ if video is not None:
     with track_b:
         minimum_area = st.slider("Minimum changed area", 4, 150, 18)
     with track_c:
-        hide_after = st.slider("Lift hand after frames", 1, 30, 5)
+        hide_after = st.slider("Lift hand after frames", 1, 30, 12)
 
     if left >= right or top >= bottom:
         st.error("The drawing area edges overlap. Please widen the selected area.")
@@ -154,4 +154,4 @@ else:
     st.info("Upload a short screen recording to begin. A 10–30 second test clip is ideal for the first validation.")
 
 st.divider()
-st.caption("Experimental MVP — automatic tracking must be validated with real drawing recordings before production use.")
+st.caption("Automatic drawing-hand tracking with canvas-color and texture compensation.")
