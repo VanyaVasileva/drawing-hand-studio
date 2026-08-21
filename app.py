@@ -77,7 +77,7 @@ if video is not None:
         tip_x = st.slider("Pencil tip X inside hand (%)", 0, 100, 15)
         tip_y = st.slider("Pencil tip Y inside hand (%)", 0, 100, 34)
     with hand_c:
-        opacity = st.slider("Hand opacity", 0.20, 1.00, 0.96, 0.02)
+        opacity = st.slider("Hand opacity", 0.20, 1.00, 0.94, 0.02)
         smoothing = st.slider("Movement smoothing", 0.05, 1.00, 0.42, 0.01)
 
     st.subheader("3. Tracking")
