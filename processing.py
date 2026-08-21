@@ -8,7 +8,7 @@ from typing import Callable
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -24,8 +24,8 @@ class RenderConfig:
     hand_width_percent: float = 34.0
     hand_opacity: float = 0.96
     hand_side: str = "Right"
-    tip_x_percent: float = 8.0
-    tip_y_percent: float = 13.0
+    tip_x_percent: float = 14.8
+    tip_y_percent: float = 34.4
     roi_left_percent: float = 0.0
     roi_top_percent: float = 0.0
     roi_right_percent: float = 100.0
@@ -42,48 +42,22 @@ class RenderResult:
     audio_preserved: bool
 
 
-def make_default_hand(width: int = 900) -> np.ndarray:
-    """Create a clean placeholder hand-and-stylus sprite as transparent RGBA."""
-    scale = 3
-    w = width * scale
-    h = int(width * 0.86) * scale
-    image = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image, "RGBA")
+DEFAULT_HAND_PATH = Path(__file__).parent / "assets" / "default_hand.png"
 
-    def pts(values: list[tuple[float, float]]) -> list[tuple[int, int]]:
-        return [(int(x * w), int(y * h)) for x, y in values]
 
-    # Soft shadow below the hand.
-    draw.ellipse((int(.33*w), int(.57*h), int(1.02*w), int(1.03*h)), fill=(50, 43, 36, 26))
+def load_default_hand() -> np.ndarray:
+    """Load the bundled illustrated hand-and-stylus sprite as transparent RGBA.
 
-    # White stylus, with its tip intentionally close to (8%, 13%).
-    stylus = pts([(.075, .13), (.105, .095), (.765, .67), (.72, .72)])
-    draw.line(stylus, fill=(62, 59, 55, 255), width=int(.043*w), joint="curve")
-    draw.line(stylus, fill=(244, 243, 239, 255), width=int(.029*w), joint="curve")
-    draw.ellipse((int(.055*w), int(.105*h), int(.095*w), int(.155*h)), fill=(45, 43, 40, 255))
-
-    skin = (224, 184, 151, 255)
-    skin_light = (241, 207, 178, 255)
-    outline = (116, 82, 65, 155)
-
-    # Palm and wrist entering from the lower-right edge.
-    palm = pts([(.47,.61),(.60,.47),(.77,.48),(.91,.61),(1.02,.75),(1.03,1.02),(.48,1.02),(.38,.83)])
-    draw.polygon(palm, fill=skin)
-    draw.line(palm + [palm[0]], fill=outline, width=int(.008*w), joint="curve")
-
-    # Fingers wrapped around the stylus.
-    draw.rounded_rectangle((int(.39*w),int(.47*h),int(.73*w),int(.64*h)), radius=int(.07*w), fill=skin_light, outline=outline, width=int(.008*w))
-    draw.rounded_rectangle((int(.49*w),int(.55*h),int(.83*w),int(.72*h)), radius=int(.07*w), fill=skin, outline=outline, width=int(.008*w))
-    draw.rounded_rectangle((int(.54*w),int(.64*h),int(.88*w),int(.80*h)), radius=int(.065*w), fill=skin, outline=outline, width=int(.008*w))
-    draw.ellipse((int(.37*w),int(.39*h),int(.62*w),int(.67*h)), fill=skin_light, outline=outline, width=int(.008*w))
-
-    image = image.resize((width, int(width * .86)), Image.Resampling.LANCZOS)
+    Pencil tip sits at roughly (14.8%, 34.4%) of the sprite's width/height,
+    matching RenderConfig.tip_x_percent / tip_y_percent defaults.
+    """
+    image = Image.open(DEFAULT_HAND_PATH).convert("RGBA")
     return np.asarray(image)
 
 
 def load_hand_image(data: bytes | None) -> np.ndarray:
     if not data:
-        return make_default_hand()
+        return load_default_hand()
     from io import BytesIO
 
     image = Image.open(BytesIO(data)).convert("RGBA")
