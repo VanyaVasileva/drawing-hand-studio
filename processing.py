@@ -22,7 +22,7 @@ class RenderConfig:
     smoothing: float = 0.42
     hide_after_frames: int = 12
     maximum_jump: int = 220
-    hand_width_percent: float = 34.0
+    hand_width_percent: float = 50.0
     hand_opacity: float = 0.94
     hand_side: str = "Right"
     tip_x_percent: float = 14.8
@@ -182,31 +182,31 @@ def _candidate_from_components(
     maximum_jump: float,
     minimum_area: int,
 ) -> tuple[float, float] | None:
-    """Track coherent new-ink regions, not scattered paper/compression noise."""
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    """Track the center of coherent new-ink regions to avoid tip jitter."""
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
     frame_area = mask.shape[0] * mask.shape[1]
     max_area = max(minimum_area * 4, int(frame_area * 0.045))
-    choices: list[tuple[float, int, int]] = []
+    choices: list[tuple[float, int]] = []
 
     for index in range(1, count):
         x, y, w, h, area = [int(v) for v in stats[index]]
         if area < minimum_area or area > max_area:
             continue
+        cx, cy = float(centroids[index][0]), float(centroids[index][1])
         if previous is None:
             score = -float(area)
         else:
-            distance = _bbox_distance(x, y, w, h, previous)
-            if distance > maximum_jump * 1.35:
+            distance = float(np.hypot(cx - previous[0], cy - previous[1]))
+            if distance > maximum_jump * 1.20:
                 continue
-            score = distance - min(area, 1200) * 0.012
-        choices.append((score, index, area))
+            score = distance - min(area, 1200) * 0.008
+        choices.append((score, index))
 
     if not choices:
         return None
     choices.sort(key=lambda item: item[0])
-    _, best_index, _ = choices[0]
-    component = np.where(labels == best_index, 255, 0).astype(np.uint8)
-    return _candidate_from_change(component, previous, maximum_jump)
+    best_index = choices[0][1]
+    return float(centroids[best_index][0]), float(centroids[best_index][1])
 
 
 def _open_video_writer(path: Path, fps: float, width: int, height: int):
@@ -315,6 +315,7 @@ def render_hand_video(
     baseline: np.ndarray | None = None
     delta_history: deque[np.ndarray] = deque(maxlen=6)
     tracked: tuple[float, float] | None = None
+    candidate_history: deque[tuple[float, float]] = deque(maxlen=5)
     idle_frames = config.hide_after_frames + 1
     hold_frames = max(config.hide_after_frames, int(round(fps * 0.35)))
     minimum_component_area = max(10, int(round(config.minimum_change_area * max(0.6, tracking_scale))))
@@ -355,14 +356,27 @@ def render_hand_video(
 
             delta_history.append(background_delta)
             if candidate is not None:
+                candidate_history.append(candidate)
+                stable_candidate = (
+                    float(np.median([point[0] for point in candidate_history])),
+                    float(np.median([point[1] for point in candidate_history])),
+                )
                 if tracked is None:
-                    tracked = candidate
+                    tracked = stable_candidate
                 else:
-                    a = float(np.clip(config.smoothing, 0.05, 1.0))
-                    tracked = (
-                        tracked[0] * (1.0 - a) + candidate[0] * a,
-                        tracked[1] * (1.0 - a) + candidate[1] * a,
-                    )
+                    dx = stable_candidate[0] - tracked[0]
+                    dy = stable_candidate[1] - tracked[1]
+                    distance = float(np.hypot(dx, dy))
+                    dead_zone = max(3.0, width * 0.008)
+                    if distance > dead_zone:
+                        max_step = max(14.0, width * 0.045)
+                        scale = min(1.0, max_step / max(distance, 1e-6))
+                        target = (tracked[0] + dx * scale, tracked[1] + dy * scale)
+                        alpha = 0.24
+                        tracked = (
+                            tracked[0] * (1.0 - alpha) + target[0] * alpha,
+                            tracked[1] * (1.0 - alpha) + target[1] * alpha,
+                        )
                 idle_frames = 0
                 active_count += 1
             else:
