@@ -31,6 +31,7 @@ class RenderConfig:
     roi_top_percent: float = 0.0
     roi_right_percent: float = 100.0
     roi_bottom_percent: float = 100.0
+    hand_visual_lead_seconds: float = 0.07
 
 
 @dataclass(frozen=True)
@@ -284,14 +285,25 @@ def render_hand_video(
     hold_frames = max(config.hide_after_frames, int(round(fps * 0.45)))
     minimum_component_area = max(6, int(round(config.minimum_change_area * max(0.42, tracking_scale * 0.7))))
     max_change_pixels = int(track_size[0] * track_size[1] * 0.08)
+    visual_lead_frames = max(0, int(round(fps * max(0.0, config.hand_visual_lead_seconds))))
+    frame_queue: deque[np.ndarray] = deque()
+    processed = 0
     written = 0
     active_count = 0
+
+    def write_with_current_hand(output_frame: np.ndarray) -> None:
+        nonlocal written
+        if tracked is not None and idle_frames <= hold_frames:
+            _overlay_rgba(output_frame, sprite, tracked, (tip_x, tip_y), config.hand_opacity)
+        _write_video_frame(writer_state, output_frame)
+        written += 1
 
     try:
         while True:
             ok, frame = capture.read()
             if not ok:
                 break
+            processed += 1
 
             roi = frame[top:bottom, left:right]
             small = cv2.resize(roi, track_size, interpolation=cv2.INTER_AREA)
@@ -302,88 +314,90 @@ def render_hand_video(
                 if len(baseline_samples) >= calibration_frames:
                     baseline = np.median(np.stack(baseline_samples, axis=0), axis=0).astype(np.float32)
                 tracking_history.append(tracking)
-                _write_video_frame(writer_state, frame)
-                written += 1
-                continue
+            else:
+                tracking_history.append(tracking)
+                candidate = None
+                if len(tracking_history) == tracking_history.maxlen:
+                    old = tracking_history[0]
+                    primary_mask, fallback_mask = _motion_masks(tracking, old, baseline, config)
 
-            tracking_history.append(tracking)
-            candidate = None
-            if len(tracking_history) == tracking_history.maxlen:
-                old = tracking_history[0]
-                primary_mask, fallback_mask = _motion_masks(tracking, old, baseline, config)
+                    guard_top = max(1, int(track_size[1] * 0.035))
+                    guard_side = max(1, int(track_size[0] * 0.018))
+                    for mask in (primary_mask, fallback_mask):
+                        mask[:guard_top, :] = 0
+                        mask[:, :guard_side] = 0
+                        mask[:, -guard_side:] = 0
 
-                guard_top = max(1, int(track_size[1] * 0.035))
-                guard_side = max(1, int(track_size[0] * 0.018))
-                for mask in (primary_mask, fallback_mask):
-                    mask[:guard_top, :] = 0
-                    mask[:, :guard_side] = 0
-                    mask[:, -guard_side:] = 0
+                    previous_local = None
+                    if tracked is not None:
+                        previous_local = (
+                            (tracked[0] - left) * tracking_scale,
+                            (tracked[1] - top) * tracking_scale,
+                        )
 
-                previous_local = None
-                if tracked is not None:
-                    previous_local = (
-                        (tracked[0] - left) * tracking_scale,
-                        (tracked[1] - top) * tracking_scale,
-                    )
-
-                primary_area = int(cv2.countNonZero(primary_mask))
-                if config.minimum_change_area <= primary_area <= max_change_pixels:
-                    local = _candidate_from_components(
-                        primary_mask,
-                        previous_local,
-                        config.maximum_jump * tracking_scale,
-                        minimum_component_area,
-                    )
-                    if local is not None:
-                        candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
-
-                if candidate is None and tracked is not None:
-                    fallback_area = int(cv2.countNonZero(fallback_mask))
-                    if config.minimum_change_area <= fallback_area <= max_change_pixels:
+                    primary_area = int(cv2.countNonZero(primary_mask))
+                    if config.minimum_change_area <= primary_area <= max_change_pixels:
                         local = _candidate_from_components(
-                            fallback_mask,
+                            primary_mask,
                             previous_local,
-                            config.maximum_jump * tracking_scale * 0.72,
+                            config.maximum_jump * tracking_scale,
                             minimum_component_area,
                         )
                         if local is not None:
                             candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
 
-            if candidate is not None:
-                candidate_history.append(candidate)
-                stable_candidate = (
-                    float(np.median([point[0] for point in candidate_history])),
-                    float(np.median([point[1] for point in candidate_history])),
-                )
-                if tracked is None:
-                    tracked = stable_candidate
+                    if candidate is None and tracked is not None:
+                        fallback_area = int(cv2.countNonZero(fallback_mask))
+                        if config.minimum_change_area <= fallback_area <= max_change_pixels:
+                            local = _candidate_from_components(
+                                fallback_mask,
+                                previous_local,
+                                config.maximum_jump * tracking_scale * 0.72,
+                                minimum_component_area,
+                            )
+                            if local is not None:
+                                candidate = (local[0] / tracking_scale + left, local[1] / tracking_scale + top)
+
+                if candidate is not None:
+                    candidate_history.append(candidate)
+                    stable_candidate = (
+                        float(np.median([point[0] for point in candidate_history])),
+                        float(np.median([point[1] for point in candidate_history])),
+                    )
+                    if tracked is None:
+                        tracked = stable_candidate
+                    else:
+                        dx = stable_candidate[0] - tracked[0]
+                        dy = stable_candidate[1] - tracked[1]
+                        distance = float(np.hypot(dx, dy))
+                        dead_zone = max(3.0, width * 0.007)
+                        if distance > dead_zone:
+                            max_step = max(14.0, width * 0.040)
+                            scale = min(1.0, max_step / max(distance, 1e-6))
+                            target = (tracked[0] + dx * scale, tracked[1] + dy * scale)
+                            alpha = float(np.clip(config.smoothing, 0.18, 0.48))
+                            tracked = (
+                                tracked[0] * (1.0 - alpha) + target[0] * alpha,
+                                tracked[1] * (1.0 - alpha) + target[1] * alpha,
+                            )
+                    idle_frames = 0
+                    active_count += 1
                 else:
-                    dx = stable_candidate[0] - tracked[0]
-                    dy = stable_candidate[1] - tracked[1]
-                    distance = float(np.hypot(dx, dy))
-                    dead_zone = max(3.0, width * 0.007)
-                    if distance > dead_zone:
-                        max_step = max(14.0, width * 0.040)
-                        scale = min(1.0, max_step / max(distance, 1e-6))
-                        target = (tracked[0] + dx * scale, tracked[1] + dy * scale)
-                        alpha = float(np.clip(config.smoothing, 0.18, 0.48))
-                        tracked = (
-                            tracked[0] * (1.0 - alpha) + target[0] * alpha,
-                            tracked[1] * (1.0 - alpha) + target[1] * alpha,
-                        )
-                idle_frames = 0
-                active_count += 1
-            else:
-                idle_frames += 1
+                    idle_frames += 1
 
-            if tracked is not None and idle_frames <= hold_frames:
-                _overlay_rgba(frame, sprite, tracked, (tip_x, tip_y), config.hand_opacity)
+            # The tracker itself stays unchanged. We delay the underlying canvas
+            # frames by ~70 ms while applying the current hand position, which
+            # makes the hand/pen appear ~70 ms earlier relative to drawing/audio.
+            frame_queue.append(frame.copy())
+            if len(frame_queue) > visual_lead_frames:
+                write_with_current_hand(frame_queue.popleft())
 
-            _write_video_frame(writer_state, frame)
-            written += 1
-            if progress and (written == 1 or written % max(1, int(fps / 2)) == 0):
-                fraction = written / frame_count if frame_count > 0 else 0.0
-                progress(min(.97, fraction), f"Processing frame {written:,}")
+            if progress and (processed == 1 or processed % max(1, int(fps / 2)) == 0):
+                fraction = processed / frame_count if frame_count > 0 else 0.0
+                progress(min(.97, fraction), f"Processing frame {processed:,}")
+
+        while frame_queue:
+            write_with_current_hand(frame_queue.popleft())
     finally:
         capture.release()
         _close_video_writer(writer_state)
